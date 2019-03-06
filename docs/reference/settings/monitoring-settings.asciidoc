@@ -192,6 +192,20 @@ xpack.monitoring.exporters:
     host: ["https://10.1.2.3:9200"]
 ----------------------------------
 
+`proxy`::
+To use a proxy, specify the hostname and port of the proxy server.
++
+[source,yaml]
+----------------------------------
+xpack.monitoring.exporters:
+  example1:
+    type: http
+    host: "10.1.2.3"
+    proxy:
+      host: es-proxy-1
+      port: 8080
+----------------------------------
+
 `auth.username`::
 
 The username is required if a `auth.password` is supplied.

@@ -121,6 +121,18 @@ public class HttpExporter extends Exporter {
             Setting.affixKeySetting("xpack.monitoring.exporters.","ssl",
                     (key) -> Setting.groupSetting(key + ".", Property.Dynamic, Property.NodeScope, Property.Filtered));
     /**
+     * Proxy host settings
+     */
+    public static final Setting.AffixSetting<String> PROXY_HOST_SETTING =
+        Setting.affixKeySetting("xpack.monitoring.exporters.", "proxy.host",
+                (key) -> Setting.simpleString(key, Property.Dynamic, Property.NodeScope));
+    /**
+     * Proxy port settings
+     */
+    public static final Setting.AffixSetting<String> PROXY_PORT_SETTING =
+        Setting.affixKeySetting("xpack.monitoring.exporters.", "proxy.port",
+                (key) -> Setting.simpleString(key, Property.Dynamic, Property.NodeScope));
+    /**
      * Proxy setting to allow users to send requests to a remote cluster that requires a proxy base path.
      */
     public static final Setting.AffixSetting<String> PROXY_BASE_PATH_SETTING =
@@ -304,6 +316,8 @@ public class HttpExporter extends Exporter {
             }
         }
 
+        // set proxy settings
+        configureProxy(builder, config);
         // allow the user to configure headers that go along with _every_ request
         configureHeaders(builder, config);
         // commercial X-Pack users can have Security enabled (auth and SSL/TLS), and also clusters behind proxies
@@ -460,6 +474,21 @@ public class HttpExporter extends Exporter {
         }
 
         builder.setDefaultHeaders(headers.toArray(new Header[headers.size()]));
+    }
+
+    /** Configure proxy servers
+     *
+     * @param builder The REST client builder to configure
+     * @param config The exporter's configuraiton
+     * @throws SettingsException if any setting causes issues
+     */
+    private static void configureProxy(final RestClientBuilder builder, final Config config) {
+        final String proxyHostname = PROXY_HOST_SETTING.getConcreteSettingForNamespace(config.name()).get(config.settings());
+        final String proxyPort = AUTH_PASSWORD_SETTING.getConcreteSettingForNamespace(config.name()).get(config.settings());
+        if (hostPort != null) {
+            // TODO coerece into httpstr
+            builder.setHttpClientConfigCallback(new ProxyHttpClientConfigCallback(proxyHostname, proxyPort));
+        }
     }
 
     /**
@@ -704,6 +733,7 @@ public class HttpExporter extends Exporter {
     public static List<Setting.AffixSetting<?>> getSettings() {
         return Arrays.asList(HOST_SETTING, TEMPLATE_CREATE_LEGACY_VERSIONS_SETTING, AUTH_PASSWORD_SETTING, AUTH_USERNAME_SETTING,
                 BULK_TIMEOUT_SETTING, CONNECTION_READ_TIMEOUT_SETTING, CONNECTION_TIMEOUT_SETTING, PIPELINE_CHECK_TIMEOUT_SETTING,
-                PROXY_BASE_PATH_SETTING, SNIFF_ENABLED_SETTING, TEMPLATE_CHECK_TIMEOUT_SETTING, SSL_SETTING, HEADERS_SETTING);
+                PROXY_BASE_PATH_SETTING, PROXY_HOST_SETTING, PROXY_PORT_SETTING, SNIFF_ENABLED_SETTING,
+                TEMPLATE_CHECK_TIMEOUT_SETTING, SSL_SETTING, HEADERS_SETTING);
     }
 }

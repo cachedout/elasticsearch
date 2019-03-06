@@ -131,6 +131,22 @@ xpack.monitoring.exporters:
 --------------------------------------------------
 --
 
+.. If the use of a proxy is required, proxy settings may be added to the
+configuration. For example:
++
+--
+[source,yaml]
+--------------------------------------------------
+xpack.monitoring.exporters:
+  id1:
+    type: http
+    host: ["http://es-mon-1:9200", "http://es-mon2:9200"] 
+    proxy:
+      host: es-proxy-1
+      port: 8080
+--------------------------------------------------
+--
+
 .. If the Elastic {security-features} are enabled on the monitoring cluster, you 
 must provide appropriate credentials when data is shipped to the monitoring cluster:
 
