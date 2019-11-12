@@ -10,26 +10,49 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.logging.log4j.util.Supplier;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.admin.indices.template.put.PutIndexTemplateRequest;
+import org.elasticsearch.action.support.master.AcknowledgedResponse;
+import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.block.ClusterBlockLevel;
+import org.elasticsearch.cluster.metadata.IndexTemplateMetaData;
+import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+import org.elasticsearch.common.util.concurrent.ThreadContext;
+import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.core.monitoring.exporter.MonitoringDoc;
+import org.elasticsearch.xpack.core.monitoring.exporter.MonitoringTemplateUtils;
+import org.elasticsearch.xpack.core.watcher.watch.Watch;
 import org.elasticsearch.xpack.monitoring.collector.Collector;
 import org.elasticsearch.xpack.monitoring.exporter.Exporters;
 
 import java.io.Closeable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Map.Entry;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import static org.elasticsearch.xpack.core.ClientHelper.MONITORING_ORIGIN;
+import static org.elasticsearch.xpack.core.ClientHelper.executeAsyncWithOrigin;
+import static org.elasticsearch.xpack.core.monitoring.exporter.MonitoringTemplateUtils.LAST_UPDATED_VERSION;
+import static org.elasticsearch.xpack.core.monitoring.exporter.MonitoringTemplateUtils.PIPELINE_IDS;
+import static org.elasticsearch.xpack.core.monitoring.exporter.MonitoringTemplateUtils.pipelineName;
 
 /**
  * The {@code MonitoringService} is a service that does the work of publishing the details to the monitoring cluster.
@@ -38,6 +61,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * service life cycles, the intended way to temporarily stop the publishing is using the start and stop methods.
  */
 public class MonitoringService extends AbstractLifecycleComponent {
+    
+    private final AtomicBoolean installingSomething = new AtomicBoolean(false);
+    
     private static final Logger logger = LogManager.getLogger(MonitoringService.class);
 
 
@@ -88,9 +114,10 @@ public class MonitoringService extends AbstractLifecycleComponent {
     private volatile boolean enabled;
     private volatile TimeValue interval;
     private volatile ThreadPool.Cancellable scheduler;
+    private final Client client;
 
     MonitoringService(Settings settings, ClusterService clusterService, ThreadPool threadPool,
-                      Set<Collector> collectors, Exporters exporters) {
+                      Set<Collector> collectors, Exporters exporters, Client client) {
         this.clusterService = Objects.requireNonNull(clusterService);
         this.threadPool = Objects.requireNonNull(threadPool);
         this.collectors = Objects.requireNonNull(collectors);
@@ -98,6 +125,7 @@ public class MonitoringService extends AbstractLifecycleComponent {
         this.elasticsearchCollectionEnabled = ELASTICSEARCH_COLLECTION_ENABLED.get(settings);
         this.enabled = ENABLED.get(settings);
         this.interval = INTERVAL.get(settings);
+        this.client = Objects.requireNonNull(client);
 
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ELASTICSEARCH_COLLECTION_ENABLED, this::setElasticsearchCollectionEnabled);
@@ -143,12 +171,147 @@ public class MonitoringService extends AbstractLifecycleComponent {
     boolean isStarted() {
         return started.get();
     }
+    
+    private boolean hasTemplate(final ClusterState clusterState, final String templateName) {
+        final IndexTemplateMetaData template = clusterState.getMetaData().getTemplates().get(templateName);
+
+        return template != null && hasValidVersion(template.getVersion(), LAST_UPDATED_VERSION);
+    }
+    
+    /**
+     * Determine if the {@code version} is defined and greater than or equal to the {@code minimumVersion}.
+     *
+     * @param version The version to check
+     * @param minimumVersion The minimum version required to be a "valid" version
+     * @return {@code true} if the version exists and it's &gt;= to the minimum version. {@code false} otherwise.
+     */
+    private boolean hasValidVersion(final Object version, final long minimumVersion) {
+        return version instanceof Number && ((Number)version).intValue() >= minimumVersion;
+    }
+    
+    /**
+     * Acknowledge success / failure for any given creation attempt (e.g., template or pipeline).
+     */
+    private class ResponseActionListener<Response> implements ActionListener<Response> {
+
+        private final String type;
+        private final String name;
+        private final AtomicInteger countDown;
+        private final AtomicBoolean setup;
+
+        private ResponseActionListener(String type, String name, AtomicInteger countDown) {
+            this(type, name, countDown, null);
+        }
+
+        private ResponseActionListener(String type, String name, AtomicInteger countDown, @Nullable AtomicBoolean setup) {
+            this.type = Objects.requireNonNull(type);
+            this.name = Objects.requireNonNull(name);
+            this.countDown = Objects.requireNonNull(countDown);
+            this.setup = setup;
+        }
+
+        @Override
+        public void onResponse(Response response) {
+            responseReceived(countDown, true, setup);
+            if (response instanceof AcknowledgedResponse) {
+                if (((AcknowledgedResponse)response).isAcknowledged()) {
+                    logger.trace("successfully set monitoring {} [{}]", type, name);
+                } else {
+                    logger.error("failed to set monitoring {} [{}]", type, name);
+                }
+            } else {
+                logger.trace("successfully handled monitoring {} [{}]", type, name);
+            }
+        }
+
+        @Override
+        public void onFailure(Exception e) {
+            responseReceived(countDown, false, setup);
+            logger.error((Supplier<?>) () -> new ParameterizedMessage("failed to set monitoring {} [{}]", type, name), e);
+        }
+    }
+    
+    private void responseReceived(final AtomicInteger pendingResponses, final boolean success, final @Nullable AtomicBoolean setup) {
+        if (setup != null && success == false) {
+            setup.set(false);
+        }
+
+        if (pendingResponses.decrementAndGet() <= 0) {
+            logger.trace("all installation requests returned a response");
+            if (installingSomething.compareAndSet(true, false) == false) {
+                throw new IllegalStateException("could not reset installing flag to false");
+            }
+        }
+    }
+    
+    // FIXME this should use the IndexTemplateMetaDataUpgrader
+    private void putTemplate(String template, String source, ActionListener<AcknowledgedResponse> listener) {
+        logger.debug("installing template [{}]", template);
+
+        PutIndexTemplateRequest request = new PutIndexTemplateRequest(template).source(source, XContentType.JSON);
+        assert !Thread.currentThread().isInterrupted() : "current thread has been interrupted before putting index template!!!";
+
+        executeAsyncWithOrigin(client.threadPool().getThreadContext(), MONITORING_ORIGIN, request, listener,
+                client.admin().indices()::putTemplate);
+    }
+
+    
+    /**
+     * When on the elected master, we setup all resources (mapping types, templates, and pipelines) before we attempt to run the exporter.
+     * If those resources do not exist, then we will create them.
+     *
+     * @return {@code true} indicates that all resources are "ready" and the exporter can be used. {@code false} to stop and wait.
+     */
+    private boolean preFlightResourceCreation() {
+        logger.info("running monitoring assets pre-flight creation");
+        // we are on the elected master
+        // Check that there is nothing that could block metadata updates
+
+        // build a list for everything that is missing, but do not start execution
+        final List<Runnable> asyncActions = new ArrayList<>();
+        final AtomicInteger pendingResponses = new AtomicInteger(0);
+
+        
+        final Map<String, String> templates = Arrays.stream(MonitoringTemplateUtils.TEMPLATE_IDS)
+                .collect(Collectors.toMap(MonitoringTemplateUtils::templateName, MonitoringTemplateUtils::loadTemplate));
+        // Check that each required template exists, installing it if needed
+//        final List<Entry<String, String>> missingTemplates = templates.entrySet()
+//                .stream()
+//                .filter((e) -> hasTemplate(clusterService.state(), e.getKey()) == false)
+//                .collect(Collectors.toList());
+        
+
+            for (Entry<String, String> template : templates.entrySet()) {
+                asyncActions.add(() -> putTemplate(template.getKey(), template.getValue(),
+                        new ResponseActionListener<>("template", template.getKey(), pendingResponses)));
+            }
+
+        if (asyncActions.size() > 0) {
+            if (installingSomething.compareAndSet(false, true)) {
+                pendingResponses.set(asyncActions.size());
+                try (ThreadContext.StoredContext ignore = client.threadPool().getThreadContext().stashWithOrigin(MONITORING_ORIGIN)) {
+                    asyncActions.forEach(Runnable::run);
+                }
+            } else {
+                // let the cluster catch up since requested installations may be ongoing
+                return false;
+            }
+        } else {
+            logger.debug("monitoring index templates and pipelines are installed on master node, service can start");
+        }
+
+        // everything is setup (or running)
+        return true;
+    }
 
     @Override
     protected void doStart() {
+        logger.info("SETTINGS MONITORING SERVICE AS ACTIVE");
+
         if (started.compareAndSet(false, true)) {
             try {
                 logger.debug("monitoring service is starting");
+                preFlightResourceCreation();
                 scheduleExecution();
                 logger.debug("monitoring service started");
             } catch (Exception e) {

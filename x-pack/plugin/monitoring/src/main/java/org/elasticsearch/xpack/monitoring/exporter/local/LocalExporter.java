@@ -266,21 +266,23 @@ public class LocalExporter extends Exporter implements ClusterStateListener, Cle
         // build a list of runnables for everything that is missing, but do not start execution
         final List<Runnable> asyncActions = new ArrayList<>();
         final AtomicInteger pendingResponses = new AtomicInteger(0);
+       
+        logger.info("SKIPPING EXPORTER SETUP");
 
-        // Check that each required template exists, installing it if needed
-        final List<Entry<String, String>> missingTemplates = templates.entrySet()
-                .stream()
-                .filter((e) -> hasTemplate(clusterState, e.getKey()) == false)
-                .collect(Collectors.toList());
-
-        if (missingTemplates.isEmpty() == false) {
-            logger.debug((Supplier<?>) () -> new ParameterizedMessage("template {} not found",
-                    missingTemplates.stream().map(Map.Entry::getKey).collect(Collectors.toList())));
-            for (Entry<String, String> template : missingTemplates) {
-                asyncActions.add(() -> putTemplate(template.getKey(), template.getValue(),
-                        new ResponseActionListener<>("template", template.getKey(), pendingResponses)));
-            }
-        }
+//        // Check that each required template exists, installing it if needed
+//        final List<Entry<String, String>> missingTemplates = templates.entrySet()
+//                .stream()
+//                .filter((e) -> hasTemplate(clusterState, e.getKey()) == false)
+//                .collect(Collectors.toList());
+//
+//        if (missingTemplates.isEmpty() == false) {
+//            logger.debug((Supplier<?>) () -> new ParameterizedMessage("template {} not found",
+//                    missingTemplates.stream().map(Map.Entry::getKey).collect(Collectors.toList())));
+//            for (Entry<String, String> template : missingTemplates) {
+//                asyncActions.add(() -> putTemplate(template.getKey(), template.getValue(),
+//                        new ResponseActionListener<>("template", template.getKey(), pendingResponses)));
+//            }
+//        }
 
         if (useIngest) {
             final List<String> missingPipelines = Arrays.stream(PIPELINE_IDS)

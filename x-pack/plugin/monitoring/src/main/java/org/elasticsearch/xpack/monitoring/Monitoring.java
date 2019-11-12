@@ -123,7 +123,7 @@ public class Monitoring extends Plugin implements ActionPlugin {
         collectors.add(new StatsCollector(settings, clusterService, getLicenseState(), client));
         collectors.add(new EnrichStatsCollector(clusterService, getLicenseState(), client, settings));
 
-        final MonitoringService monitoringService = new MonitoringService(settings, clusterService, threadPool, collectors, exporters);
+        final MonitoringService monitoringService = new MonitoringService(settings, clusterService, threadPool, collectors, exporters, client);
 
         var usageServices = new MonitoringUsageServices(monitoringService, exporters);
         return Arrays.asList(monitoringService, exporters, cleanerService, usageServices);
